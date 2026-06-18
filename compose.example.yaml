@@ -1,0 +1,13 @@
+services:
+  cpa-context-bridge:
+    image: ghcr.io/YOUR_GITHUB_USERNAME/cpa-context-bridge:latest
+    container_name: cpa-context-bridge
+    restart: unless-stopped
+    environment:
+      # Root URL, not /v1. If you set /v1 here, the bridge still handles it.
+      UPSTREAM_BASE: http://192.168.1.138:58317
+      CLIENT_VERSION: "0.133.0"
+      MODELS_CACHE_TTL_SECONDS: "60"
+      ENRICH_MODE: useful # minimal|useful|all
+    ports:
+      - "58318:58318"
