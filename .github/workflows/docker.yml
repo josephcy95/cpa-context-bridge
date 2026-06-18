@@ -1,12 +1,12 @@
 name: Docker
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*.*.*']
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Docker tag to publish in addition to latest'
+        required: false
+        default: 'manual'
 
 permissions:
   contents: read
@@ -41,10 +41,9 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=tag
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
       - uses: docker/build-push-action@v6
         with:
           context: .
