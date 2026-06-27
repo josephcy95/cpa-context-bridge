@@ -4,10 +4,19 @@ services:
     container_name: cpa-context-bridge
     restart: unless-stopped
     environment:
-      # Root URL, not /v1. If you set /v1 here, the bridge still handles it.
+      # CPA root URL, not /v1. If you set /v1 here, the bridge still handles it.
       UPSTREAM_BASE: http://192.168.1.138:58317
       CLIENT_VERSION: "0.133.0"
       MODELS_CACHE_TTL_SECONDS: "60"
       ENRICH_MODE: useful # minimal|useful|all
+      # Re-pull the baked catalogs (CLIProxyAPI + models.dev) every N hours.
+      CATALOG_REFRESH_HOURS: "24"
+      # owned_by values treated as passthrough upstreams: CPA stamps a fake
+      # 272k template on these, so it's discarded and re-resolved from the
+      # baked catalogs / models.dev / overrides. Comma-separated.
+      PASSTHROUGH_OWNERS: "9router"
+      # Optional: pin / correct specific models. Highest priority.
+      # Keys may be bare slug or alias/slug; value is an int or an object.
+      # CONTEXT_OVERRIDES: '{"kr/claude-opus-4.8-thinking": 200000}'
     ports:
       - "58318:58318"

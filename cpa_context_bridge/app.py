@@ -9,6 +9,9 @@ from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout, web
 
+from . import catalog
+from .catalog import ContextInfo
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cpa-context-bridge")
@@ -18,6 +21,21 @@ CLIENT_VERSION = os.getenv("CLIENT_VERSION", "0.133.0")
 MODELS_CACHE_TTL_SECONDS = int(os.getenv("MODELS_CACHE_TTL_SECONDS", "60"))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "60"))
 ENRICH_MODE = os.getenv("ENRICH_MODE", "useful").strip().lower()  # useful|all|minimal
+
+# Refresh the baked catalogs (CLIProxyAPI + models.dev) from their source URLs
+# every N hours. 0 disables (rely on the baked snapshot + scheduled re-bake).
+CATALOG_REFRESH_HOURS = float(os.getenv("CATALOG_REFRESH_HOURS", "24"))
+
+# Models whose `owned_by` is one of these are passthrough/upstream providers
+# (e.g. a 9router added to CPA as an openai-compatible provider). CPA stamps a
+# fabricated GPT-5.5 template (context 272k + full metadata) onto models it does
+# not natively know, so for these owners we IGNORE the live CPA catalog and use
+# the fallback chain (baked CPA json -> models.dev -> override) instead.
+PASSTHROUGH_OWNERS = {
+    o.strip().lower()
+    for o in os.getenv("PASSTHROUGH_OWNERS", "9router").split(",")
+    if o.strip()
+}
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -86,6 +104,11 @@ class CacheEntry:
 
 _models_cache: dict[str, CacheEntry] = {}
 _session: ClientSession | None = None
+
+# Baked fallback context maps, assembled at startup and on refresh.
+_cpa_map: dict[str, ContextInfo] = {}        # CLIProxyAPI baked catalog
+_modelsdev_map: dict[str, ContextInfo] = {}  # models.dev fallback
+_overrides: dict[str, ContextInfo] = {}      # CONTEXT_OVERRIDES env
 
 
 def upstream_url(path_qs: str) -> str:
@@ -186,6 +209,12 @@ def merge_model_metadata(openai_models_payload: dict[str, Any], codex_payload: d
         model_id = model.get("id")
         if not isinstance(model_id, str):
             continue
+        # Passthrough/upstream providers (e.g. 9router) get a fabricated GPT-5.5
+        # template from CPA's live catalog. Skip them here so the fallback chain
+        # (baked CPA -> models.dev -> override) supplies the real number instead.
+        owner = model.get("owned_by")
+        if isinstance(owner, str) and owner.strip().lower() in PASSTHROUGH_OWNERS:
+            continue
         meta = by_id.get(model_id)
         if not meta:
             continue
@@ -209,6 +238,68 @@ def merge_model_metadata(openai_models_payload: dict[str, Any], codex_payload: d
             model["max_completion_tokens"] = max_out
 
     return openai_models_payload
+
+
+def resolve_fallback(model_id: str) -> ContextInfo | None:
+    """Baked-catalog fallback: baked CPA json first, then models.dev.
+
+    The live CPA ``?client_version=`` catalog is handled by
+    ``merge_model_metadata``; this only covers models that live catalog did not
+    return (e.g. 9router-upstream free providers). Overrides are applied
+    separately and win over everything.
+    """
+    info = catalog.lookup(_cpa_map, model_id)
+    if info is not None:
+        return info
+    return catalog.lookup(_modelsdev_map, model_id)
+
+
+def apply_context_fallbacks(payload: dict[str, Any]) -> dict[str, Any]:
+    """Resolve context_length for each model, then apply CONTEXT_OVERRIDES.
+
+    * Native CPA owners (openai/antigravity/...): trust the value CPA already
+      supplied; only fall back (baked CPA -> models.dev) when it is missing.
+    * Passthrough owners (e.g. 9router): CPA's value is the fabricated 272k
+      GPT-5.5 template, so DISCARD it and re-resolve from baked CPA -> models.dev.
+      If neither has the model, leave it blank (honest "unknown") rather than
+      keep the fake number.
+    * CONTEXT_OVERRIDES win over every source.
+    """
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return payload
+    for model in data:
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id")
+        if not isinstance(model_id, str):
+            continue
+        owner = model.get("owned_by")
+        is_passthrough = isinstance(owner, str) and owner.strip().lower() in PASSTHROUGH_OWNERS
+
+        if is_passthrough:
+            info = resolve_fallback(model_id)
+            if info is not None:
+                model["context_length"] = info.context_length
+                if info.max_completion_tokens:
+                    model["max_completion_tokens"] = info.max_completion_tokens
+            else:
+                # No trustworthy source; drop CPA's fabricated template value.
+                model.pop("context_length", None)
+        elif "context_length" not in model:
+            info = resolve_fallback(model_id)
+            if info is not None:
+                model["context_length"] = info.context_length
+                if info.max_completion_tokens and "max_completion_tokens" not in model:
+                    model["max_completion_tokens"] = info.max_completion_tokens
+
+        # Overrides win over every source.
+        ov = _overrides.get(catalog.normalize_slug(catalog.strip_alias(model_id)))
+        if ov is not None:
+            model["context_length"] = ov.context_length
+            if ov.max_completion_tokens:
+                model["max_completion_tokens"] = ov.max_completion_tokens
+    return payload
 
 
 async def get_session() -> ClientSession:
@@ -253,6 +344,14 @@ async def enrich_models_response(request: web.Request) -> web.Response:
                 normal_json = merge_model_metadata(normal_json, codex_json)
     except Exception as exc:  # noqa: BLE001 - enrichment must be non-fatal
         log.warning("model metadata enrichment failed; returning plain /models: %s", exc)
+
+    # Layered fallback for anything the live CPA catalog didn't cover:
+    # baked CPA json -> models.dev, then CONTEXT_OVERRIDES win over all.
+    try:
+        if isinstance(normal_json, dict):
+            normal_json = apply_context_fallbacks(normal_json)
+    except Exception as exc:  # noqa: BLE001 - must be non-fatal
+        log.warning("context fallback failed; continuing: %s", exc)
 
     body = json.dumps(normal_json, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     headers_out = {k: v for k, v in normal_headers.items() if k.lower() != "content-type"}
@@ -301,7 +400,15 @@ async def proxy_stream(request: web.Request) -> web.StreamResponse:
 
 async def handle(request: web.Request) -> web.StreamResponse:
     if request.method == "GET" and request.path.rstrip("/") == "/healthz":
-        return web.json_response({"ok": True, "upstream_base": UPSTREAM_BASE})
+        return web.json_response(
+            {
+                "ok": True,
+                "upstream_base": UPSTREAM_BASE,
+                "cpa_slugs": len(_cpa_map),
+                "modelsdev_slugs": len(_modelsdev_map),
+                "overrides": len(_overrides),
+            }
+        )
 
     if (
         request.method == "GET"
@@ -313,7 +420,68 @@ async def handle(request: web.Request) -> web.StreamResponse:
     return await proxy_stream(request)
 
 
+async def fetch_remote_json(url: str) -> dict[str, Any] | None:
+    try:
+        session = await get_session()
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                return None
+            return json.loads(await resp.read())
+    except Exception as exc:  # noqa: BLE001
+        log.info("catalog refresh fetch failed for %s: %s", url, exc)
+        return None
+
+
+async def rebuild_maps(*, allow_remote: bool) -> None:
+    """Rebuild the baked fallback maps, optionally overlaying remote sources."""
+    global _cpa_map, _modelsdev_map
+    codex, models, modelsdev = catalog.load_baked()
+    if allow_remote:
+        remote_codex = await fetch_remote_json(catalog.CODEX_URL)
+        remote_models = await fetch_remote_json(catalog.MODELS_URL)
+        remote_md = await fetch_remote_json(catalog.MODELSDEV_URL)
+        if remote_codex:
+            codex = remote_codex
+        if remote_models:
+            models = remote_models
+        if remote_md:
+            modelsdev = remote_md
+    cpa = catalog.build_map(codex, models)
+    md = catalog.build_modelsdev_map(modelsdev)
+    if cpa:
+        _cpa_map = cpa
+    if md:
+        _modelsdev_map = md
+    log.info(
+        "fallback maps rebuilt: cpa=%d slugs, models.dev=%d slugs (remote=%s)",
+        len(_cpa_map),
+        len(_modelsdev_map),
+        allow_remote,
+    )
+
+
+async def background_refresh(app: web.Application) -> None:
+    interval = CATALOG_REFRESH_HOURS * 3600
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            await rebuild_maps(allow_remote=True)
+    except asyncio.CancelledError:
+        pass
+
+
+async def on_startup(app: web.Application) -> None:
+    global _overrides
+    _overrides = catalog.parse_context_overrides(os.getenv("CONTEXT_OVERRIDES"))
+    await rebuild_maps(allow_remote=False)
+    if CATALOG_REFRESH_HOURS > 0:
+        app["refresh_task"] = asyncio.create_task(background_refresh(app))
+
+
 async def close_session(app: web.Application) -> None:
+    task = app.get("refresh_task")
+    if task:
+        task.cancel()
     global _session
     if _session is not None and not _session.closed:
         await _session.close()
@@ -322,6 +490,7 @@ async def close_session(app: web.Application) -> None:
 def create_app() -> web.Application:
     app = web.Application(client_max_size=64 * 1024 * 1024)
     app.router.add_route("*", "/{tail:.*}", handle)
+    app.on_startup.append(on_startup)
     app.on_cleanup.append(close_session)
     return app
 
